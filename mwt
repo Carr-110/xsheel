@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  mwt [--base <ref>] [--root <dir>] [--no-shell] [--print-path] [--branch-prefix <p>]
+  mwt delete <branch> [--force] [--root <dir>]
+  mwt delete-all [--force] [--root <dir>] [--branch-prefix <p>]
+
+Default behavior:
+  - Creates a new branch from the current HEAD (typically your current branch)
+  - Adds a git worktree in: ~/Library/Application Support/mwt/worktrees/<project>/<uuid>
+  - Enters that directory and starts an interactive shell
+
+Delete behavior:
+  - Removes the worktree associated with <branch> (if any)
+  - Deletes the local branch <branch>
+
+Delete-all behavior:
+  - Removes all worktrees created under: <root>/<project>/
+  - Deletes local branches matching <branch-prefix> that point to those worktrees
+
+Options:
+  --base <ref>            Base ref/commit for the new branch (default: HEAD)
+  --root <dir>            Worktree root directory (default: ~/Library/Application Support/mwt/worktrees)
+  --branch-prefix <p>     Prefix for created branch name (default: wt-)
+  --no-shell              Do not start a shell; just create the worktree
+  --print-path            Print the created worktree path to stdout
+  --force                 For delete: force-remove worktree and delete branch
+  -h, --help              Show this help
+EOF
+}
+
+die() {
+  echo "mwt: $*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+need_cmd git
+need_cmd uuidgen
+
+short_id() {
+  uuidgen | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-6
+}
+
+force=0
+base_ref="HEAD"
+root_dir="${HOME}/Library/Application Support/mwt/worktrees"
+branch_prefix="wt-"
+start_shell=1
+print_path=0
+
+subcmd=""
+target_branch=""
+if [[ $# -ge 1 ]]; then
+  case "$1" in
+    delete|rm)
+      subcmd="delete"
+      [[ $# -ge 2 ]] || die "delete requires a branch name (use --help)"
+      target_branch="$2"
+      shift 2
+      ;;
+    delete-all)
+      subcmd="delete-all"
+      shift
+      ;;
+  esac
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)
+      [[ -z "$subcmd" ]] || die "--base is not valid with ${subcmd}"
+      [[ $# -ge 2 ]] || die "--base requires a value"
+      base_ref="$2"
+      shift 2
+      ;;
+    --root)
+      [[ $# -ge 2 ]] || die "--root requires a value"
+      root_dir="$2"
+      shift 2
+      ;;
+    --branch-prefix)
+      [[ $# -ge 2 ]] || die "--branch-prefix requires a value"
+      branch_prefix="$2"
+      shift 2
+      ;;
+    --no-shell)
+      [[ -z "$subcmd" ]] || die "--no-shell is not valid with ${subcmd}"
+      start_shell=0
+      shift
+      ;;
+    --print-path)
+      [[ -z "$subcmd" ]] || die "--print-path is not valid with ${subcmd}"
+      print_path=1
+      shift
+      ;;
+    --force)
+      force=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1 (use --help)"
+      ;;
+  esac
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git worktree"
+
+repo_root="$(git rev-parse --show-toplevel)"
+project_name="$(basename "$repo_root")"
+
+if [[ "$subcmd" == "delete" ]]; then
+  if ! git show-ref --verify --quiet "refs/heads/${target_branch}"; then
+    die "branch not found: ${target_branch}"
+  fi
+
+  # Find associated worktree path (if any) and remove it.
+  worktree_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) current_path="${line#worktree }" ;;
+      "branch "refs/heads/*)
+        current_branch="${line#branch refs/heads/}"
+        if [[ "$current_branch" == "$target_branch" ]]; then
+          worktree_path="$current_path"
+          break
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [[ -n "${worktree_path:-}" ]]; then
+    if [[ $force -eq 1 ]]; then
+      git worktree remove --force "$worktree_path"
+    else
+      git worktree remove "$worktree_path"
+    fi
+  fi
+
+  if [[ $force -eq 1 ]]; then
+    git branch -D "$target_branch" >/dev/null
+  else
+    git branch -d "$target_branch" >/dev/null
+  fi
+
+  exit 0
+fi
+
+if [[ "$subcmd" == "delete-all" ]]; then
+  worktree_parent="${root_dir%/}/${project_name}"
+  if [[ ! -d "$worktree_parent" ]]; then
+    die "no project worktree directory found: ${worktree_parent}"
+  fi
+
+  declare -a worktree_paths=()
+  declare -a branch_names=()
+
+  current_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) current_path="${line#worktree }" ;;
+      "branch "refs/heads/*)
+        b="${line#branch refs/heads/}"
+        if [[ -n "${current_path:-}" && "$current_path" == "$worktree_parent/"* ]]; then
+          worktree_paths+=("$current_path")
+          branch_names+=("$b")
+        fi
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  if [[ ${#worktree_paths[@]} -eq 0 ]]; then
+    die "no matching worktrees found under: ${worktree_parent}"
+  fi
+
+  for p in "${worktree_paths[@]}"; do
+    if [[ $force -eq 1 ]]; then
+      git worktree remove --force "$p"
+    else
+      git worktree remove "$p"
+    fi
+  done
+
+  for b in "${branch_names[@]}"; do
+    [[ "$b" == "${branch_prefix}"* ]] || continue
+    if git show-ref --verify --quiet "refs/heads/${b}"; then
+      if [[ $force -eq 1 ]]; then
+        git branch -D "$b" >/dev/null
+      else
+        git branch -d "$b" >/dev/null
+      fi
+    fi
+  done
+
+  exit 0
+fi
+
+worktree_parent="${root_dir%/}/${project_name}"
+mkdir -p "$worktree_parent"
+
+attempts=0
+max_attempts=50
+while :; do
+  attempts=$((attempts + 1))
+  [[ $attempts -le $max_attempts ]] || die "failed to generate a unique id after ${max_attempts} attempts"
+
+  id="$(short_id)"
+  branch_name="${branch_prefix}${id}"
+  worktree_path="${worktree_parent}/${id}"
+
+  git show-ref --verify --quiet "refs/heads/${branch_name}" && continue
+  [[ -e "$worktree_path" ]] && continue
+  break
+done
+
+git worktree add -b "$branch_name" "$worktree_path" "$base_ref" >/dev/null
+
+if [[ $print_path -eq 1 ]]; then
+  echo "$worktree_path"
+fi
+
+if [[ $start_shell -eq 1 ]]; then
+  cd "$worktree_path"
+  exec "${SHELL:-/bin/bash}"
+fi

@@ -1,0 +1,28 @@
+{
+  "name": "xsheel",
+  "version": "0.1.0",
+  "description": "A tiny collection of shell helpers runnable via npx.",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/REPLACE_ME/xsheel.git"
+  },
+  "bin": {
+    "xsheel": "bin/xsheel.js",
+    "mwt": "mwt"
+  },
+  "files": [
+    "bin/",
+    "tools/",
+    "README.md",
+    "mwt"
+  ],
+  "scripts": {
+    "sync-bins": "node tools/sync-bins.mjs",
+    "prepack": "node tools/sync-bins.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
